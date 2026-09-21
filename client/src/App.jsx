@@ -1,89 +1,226 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, getActor, getRole, setActor, setRole } from "./api.js";
 
-function formatMetric(m) {
+const PAGES = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "changes", label: "Metric changes" },
+  { id: "history", label: "History" },
+];
+
+const METRIC_LABELS = {
+  dau: "Daily active users",
+  d1_retention: "D1 retention",
+  revenue_proxy: "Revenue proxy",
+};
+
+const PRESETS = {
+  dau: [
+    {
+      id: "sessions",
+      label: "Count players who started a session today (UTC)",
+      stub: "Distinct players with a session_start event on the calendar day (UTC).",
+      json: {
+        event_types: ["session_start"],
+        window: "calendar_day_utc",
+        distinct: "player_id",
+      },
+    },
+    {
+      id: "broader",
+      label: "Count players with any session or level activity today (UTC)",
+      stub: "Distinct players with session_start, wave_complete, or lane_clear on the calendar day (UTC).",
+      json: {
+        event_types: ["session_start", "wave_complete", "lane_clear"],
+        window: "calendar_day_utc",
+        distinct: "player_id",
+      },
+    },
+  ],
+  d1_retention: [
+    {
+      id: "any",
+      label: "Return = any event on the next day",
+      stub: "Share of yesterday’s install cohort that returns with any event today (UTC).",
+      json: {
+        cohort_event: "install",
+        return_any_event: true,
+        offset_days: 1,
+      },
+    },
+    {
+      id: "session",
+      label: "Return = session start only on the next day",
+      stub: "Share of yesterday’s install cohort that returns with a session_start today (UTC).",
+      json: {
+        cohort_event: "install",
+        return_any_event: false,
+        return_event_types: ["session_start"],
+        offset_days: 1,
+      },
+    },
+  ],
+  revenue_proxy: [
+    {
+      id: "all",
+      label: "Sum all in-app purchases today (USD)",
+      stub: "Sum of purchase revenue today (cents ÷ 100), all SKUs.",
+      json: {
+        event_types: ["purchase"],
+        field: "revenue_cents",
+        scale: 0.01,
+      },
+    },
+    {
+      id: "no_pass",
+      label: "Sum purchases today, excluding battle pass SKU",
+      stub: "Sum of purchase revenue today (cents ÷ 100), excluding battle_pass SKUs.",
+      json: {
+        event_types: ["purchase"],
+        field: "revenue_cents",
+        scale: 0.01,
+        exclude_skus: ["battle_pass"],
+      },
+    },
+  ],
+};
+
+function metricLabel(key) {
+  return METRIC_LABELS[key] || key;
+}
+
+function formatValue(m) {
   if (!m || m.value === null || m.value === undefined) return "—";
   if (m.unit === "percent") return `${m.value}%`;
-  if (m.unit === "USD") return `$${m.value.toLocaleString()}`;
+  if (m.unit === "USD") return `$${Number(m.value).toLocaleString()}`;
   return String(m.value);
 }
 
-function Spark({ points }) {
-  const max = Math.max(1, ...points.map((p) => p.value));
-  return (
-    <div className="spark" title="7-day DAU (active definition)">
-      {points.map((p) => (
-        <span
-          key={p.day}
-          style={{ height: `${Math.max(4, (p.value / max) * 100)}%` }}
-          title={`${p.day}: ${p.value}`}
-        />
-      ))}
-    </div>
-  );
+function describeDefinition(key, definitionJson, sqlStub) {
+  if (sqlStub && String(sqlStub).trim()) return String(sqlStub).trim();
+  const d = definitionJson || {};
+  if (key === "dau") {
+    const types = (d.event_types || ["session_start"]).join(", ");
+    return `Counts distinct players with these events today (UTC): ${types}.`;
+  }
+  if (key === "d1_retention") {
+    if (d.return_any_event === false) {
+      return `Share of yesterday’s install cohort that returns today with: ${(d.return_event_types || ["session_start"]).join(", ")}.`;
+    }
+    return "Share of yesterday’s install cohort that returns today with any event.";
+  }
+  if (key === "revenue_proxy") {
+    if (d.exclude_skus?.length) {
+      return `Sum of purchase revenue today (USD), excluding SKUs: ${d.exclude_skus.join(", ")}.`;
+    }
+    return "Sum of purchase revenue today (USD), all SKUs.";
+  }
+  return JSON.stringify(d);
 }
 
-function Dashboard({ role, data, loading, error }) {
-  if (loading) return <p className="empty">Loading dashboard…</p>;
+function actionLabel(action) {
+  if (action === "metric.propose") return "Proposed";
+  if (action === "metric.approve") return "Approved";
+  if (action === "metric.reject") return "Rejected";
+  if (action === "events.seed") return "Seeded data";
+  if (action === "events.ingest") return "Ingested event";
+  return action;
+}
+
+function historySummary(entry) {
+  const d = entry.detail || {};
+  if (entry.action === "metric.propose") {
+    return `${metricLabel(d.metricKey || "")} v${d.fromVersion} → v${d.toVersion}`.trim();
+  }
+  if (entry.action === "metric.approve" || entry.action === "metric.reject") {
+    const note = d.note ? ` — ${d.note}` : "";
+    return `v${d.fromVersion} → v${d.toVersion}${note}`;
+  }
+  if (entry.action === "events.seed") {
+    return `${d.total ?? d.insertedApprox ?? "synthetic"} events`;
+  }
+  if (entry.action === "events.ingest") {
+    return `${d.titleId || ""} ${d.eventType || ""}`.trim();
+  }
+  return "";
+}
+
+function DashboardPage({ role, data, loading, error, latency }) {
+  if (loading) return <p className="empty">Loading…</p>;
   if (error) return <p className="msg err">{error}</p>;
-  if (!data) return <p className="empty">No dashboard data.</p>;
+  if (!data) return <p className="empty">No data yet.</p>;
 
   return (
     <>
-      <div className="status-row">
-        <span className="pill">role: {data.role}</span>
-        <span className={`pill ${data.cache === "hit" ? "ok" : "warn"}`}>
-          redis: {data.cache}
-        </span>
-        <span className="pill">
-          metrics: {(data.activeMetricKeys || []).join(", ")}
-        </span>
+      <div className="page-intro">
+        <p>
+          Numbers for the{" "}
+          <strong>{role === "design" ? "Game Design" : "Marketing"}</strong> view of Atlas
+          Siege and Nova Lane.
+        </p>
+        <p>These use the approved metric definitions only. Pending changes do not affect this page.</p>
       </div>
+
       {data.series?.map((s) => (
-        <div className="title-block" key={s.title.id}>
-          <h3>
-            {s.title.name}{" "}
-            <span className="mono" style={{ color: "var(--muted)", fontWeight: 400 }}>
-              {s.title.id} · {s.title.genre}
-            </span>
-          </h3>
-          <div className="metric-row">
+        <section className="title-block" key={s.title.id}>
+          <h2>{s.title.name}</h2>
+          <div className="metrics">
             {Object.entries(s.metrics || {}).map(([key, m]) => (
               <div className="metric" key={key}>
-                <div className="label">{key}</div>
-                <div className="value">{formatMetric(m)}</div>
-                <div className="meta">v{m?.version ?? "?"} · {m?.window || ""}</div>
+                <div className="label">{metricLabel(key)}</div>
+                <div className="value">{formatValue(m)}</div>
+                <div className="version">Definition v{m?.version ?? "—"}</div>
               </div>
             ))}
           </div>
-          <Spark points={s.spark || []} />
-        </div>
+        </section>
       ))}
+
       {role === "design" && (
-        <p className="sub" style={{ marginTop: "0.75rem" }}>
-          Design view hides revenue_proxy by default — same event spine, different
-          default KPI surface.
+        <p className="empty" style={{ marginBottom: "1.5rem" }}>
+          Game Design hides revenue by default. Same events, fewer metrics.
         </p>
       )}
+
+      <div className="latency-strip">
+        <span>
+          Typical response <strong>{latency?.overall?.p50 ?? "—"} ms</strong>
+          <span style={{ color: "var(--muted)" }}> (median)</span>
+        </span>
+        <span title="99th percentile response time">
+          Slow requests (p99) <strong>{latency?.overall?.p99 ?? "—"} ms</strong>
+          <span style={{ color: "var(--muted)" }}> — 99th percentile</span>
+        </span>
+        <span>
+          Samples <strong>{latency?.sampleCount ?? 0}</strong>
+        </span>
+      </div>
     </>
   );
 }
 
-function MetricRegistry({ metrics, onProposed, actor }) {
-  const [key, setKey] = useState("dau");
-  const [json, setJson] = useState(
-    JSON.stringify(
-      { event_types: ["session_start", "wave_complete", "lane_clear"], window: "calendar_day_utc", distinct: "player_id" },
-      null,
-      2
-    )
+function MetricChangesPage({ metrics, pending, onDone }) {
+  const [metricKey, setMetricKey] = useState("dau");
+  const presets = PRESETS[metricKey] || [];
+  const [presetId, setPresetId] = useState(presets[0]?.id || "");
+  const activePreset = useMemo(
+    () => presets.find((p) => p.id === presetId) || presets[0],
+    [presets, presetId]
   );
-  const [sqlStub, setSqlStub] = useState(
-    "COUNT DISTINCT player_id where event_type IN (session_start, wave_complete, lane_clear) for calendar day"
-  );
+  const [text, setText] = useState(activePreset?.stub || "");
+  const [notes, setNotes] = useState({});
   const [msg, setMsg] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const list = PRESETS[metricKey] || [];
+    setPresetId(list[0]?.id || "");
+    setText(list[0]?.stub || "");
+  }, [metricKey]);
+
+  useEffect(() => {
+    if (activePreset) setText(activePreset.stub);
+  }, [activePreset]);
 
   async function propose(e) {
     e.preventDefault();
@@ -91,14 +228,14 @@ function MetricRegistry({ metrics, onProposed, actor }) {
     setMsg(null);
     setErr(null);
     try {
-      const definitionJson = JSON.parse(json);
-      const result = await api.propose(key, {
-        definitionJson,
-        definitionSqlStub: sqlStub,
-        actor,
+      const result = await api.propose(metricKey, {
+        definitionJson: activePreset.json,
+        definitionSqlStub: text,
       });
-      setMsg(`Pending change #${result.change.id} created (v${result.change.to_version}). Dashboards unchanged until approval.`);
-      onProposed();
+      setMsg(
+        `Submitted. Change #${result.change.id} is waiting for approval — dashboards are unchanged.`
+      );
+      onDone();
     } catch (ex) {
       setErr(ex.message);
     } finally {
@@ -106,68 +243,11 @@ function MetricRegistry({ metrics, onProposed, actor }) {
     }
   }
 
-  return (
-    <>
-      <table className="table">
-        <thead>
-          <tr>
-            <th>Key</th>
-            <th>Active</th>
-            <th>Definition</th>
-          </tr>
-        </thead>
-        <tbody>
-          {(metrics || []).map((m) => (
-            <tr key={m.id}>
-              <td className="mono">{m.key}</td>
-              <td className="mono">v{m.active_version}</td>
-              <td>
-                <div>{m.name}</div>
-                <div className="mono" style={{ color: "var(--muted)", marginTop: 4 }}>
-                  {JSON.stringify(m.definition_json)}
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-
-      <form className="form-stack" style={{ marginTop: "1rem" }} onSubmit={propose}>
-        <label>
-          Propose change for metric
-          <select value={key} onChange={(e) => setKey(e.target.value)}>
-            <option value="dau">dau</option>
-            <option value="d1_retention">d1_retention</option>
-            <option value="revenue_proxy">revenue_proxy</option>
-          </select>
-        </label>
-        <label>
-          New definition JSON
-          <textarea value={json} onChange={(e) => setJson(e.target.value)} />
-        </label>
-        <label>
-          SQL stub (human-readable)
-          <input value={sqlStub} onChange={(e) => setSqlStub(e.target.value)} />
-        </label>
-        <button className="primary" type="submit" disabled={busy}>
-          {busy ? "Submitting…" : "Propose (creates pending HITL)"}
-        </button>
-        {msg && <p className="msg ok">{msg}</p>}
-        {err && <p className="msg err">{err}</p>}
-      </form>
-    </>
-  );
-}
-
-function PendingChanges({ changes, onDone }) {
-  const [notes, setNotes] = useState({});
-  const [err, setErr] = useState(null);
-
   async function act(id, kind) {
     setErr(null);
     try {
       if (kind === "approve") {
-        await api.approve(id, notes[id] || "Approved after review");
+        await api.approve(id, notes[id] || "Approved");
       } else {
         await api.reject(id, notes[id] || "");
       }
@@ -177,126 +257,172 @@ function PendingChanges({ changes, onDone }) {
     }
   }
 
-  if (!changes?.length) {
-    return <p className="empty">No pending definition changes. Propose one from the registry.</p>;
-  }
-
   return (
     <>
-      {err && <p className="msg err">{err}</p>}
-      <table className="table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Metric</th>
-            <th>Versions</th>
-            <th>Proposed</th>
-            <th>Diff / note</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {changes.map((c) => (
-            <tr key={c.id}>
-              <td className="mono">#{c.id}</td>
-              <td>
-                <div>{c.metric_name}</div>
-                <div className="mono">{c.metric_key}</div>
-              </td>
-              <td className="mono">
-                v{c.from_version} → v{c.to_version}
-              </td>
-              <td>
-                <div>{c.proposed_by}</div>
-                <div className="mono" style={{ color: "var(--muted)" }}>
-                  {new Date(c.proposed_at).toLocaleString()}
+      <div className="page-intro">
+        <p>Change how a metric is calculated. Dashboards update only after someone approves.</p>
+      </div>
+
+      <section className="zone">
+        <h2>Active definitions</h2>
+        <p className="help">What the dashboards use right now.</p>
+        <div className="def-list">
+          {(metrics || []).map((m) => (
+            <div className="def-item" key={m.id}>
+              <h3>{m.name}</h3>
+              <p className="body">
+                {describeDefinition(m.key, m.definition_json, m.definition_sql_stub)}
+              </p>
+              <p className="meta">Version {m.active_version} · approved</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="zone">
+        <h2>Pending approval</h2>
+        <p className="help">Needs approval before dashboards can use it.</p>
+        {err && <p className="msg err">{err}</p>}
+        {!pending?.length ? (
+          <p className="empty">No changes waiting for approval.</p>
+        ) : (
+          pending.map((c) => (
+            <div className="pending-card" key={c.id}>
+              <h3>
+                {c.metric_name}{" "}
+                <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+                  v{c.from_version} → v{c.to_version}
+                </span>
+              </h3>
+              <div className="who">
+                Proposed by {c.proposed_by} · {new Date(c.proposed_at).toLocaleString()}
+              </div>
+              <div className="diff">
+                <div className="row">
+                  <span className="tag">Current</span>
+                  <div className="old">
+                    {describeDefinition(
+                      c.metric_key,
+                      c.current_definition,
+                      null
+                    )}
+                  </div>
                 </div>
-              </td>
-              <td>
-                <div className="mono" style={{ color: "var(--muted)" }}>
-                  was: {JSON.stringify(c.current_definition)}
+                <div className="row">
+                  <span className="tag">Proposed</span>
+                  <div>
+                    {describeDefinition(
+                      c.metric_key,
+                      c.proposed_definition,
+                      c.proposed_sql_stub
+                    )}
+                  </div>
                 </div>
-                <div className="mono">new: {JSON.stringify(c.proposed_definition)}</div>
+              </div>
+              <div className="pending-actions">
                 <input
-                  style={{ marginTop: 6, width: "100%" }}
-                  placeholder="Review note (required to reject)"
+                  placeholder="Note (required to reject)"
                   value={notes[c.id] || ""}
                   onChange={(e) => setNotes((n) => ({ ...n, [c.id]: e.target.value }))}
                 />
-              </td>
-              <td>
-                <div className="actions">
-                  <button className="primary" onClick={() => act(c.id, "approve")}>
-                    Approve
-                  </button>
-                  <button className="danger" onClick={() => act(c.id, "reject")}>
-                    Reject
-                  </button>
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+                <button type="button" className="primary" onClick={() => act(c.id, "approve")}>
+                  Approve
+                </button>
+                <button type="button" className="danger" onClick={() => act(c.id, "reject")}>
+                  Reject
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </section>
+
+      <section className="zone">
+        <h2>Propose a change</h2>
+        <p className="help">Dashboards will not update until this is approved.</p>
+        <form className="stack" onSubmit={propose}>
+          <label>
+            Metric
+            <select value={metricKey} onChange={(e) => setMetricKey(e.target.value)}>
+              <option value="dau">Daily active users</option>
+              <option value="d1_retention">D1 retention</option>
+              <option value="revenue_proxy">Revenue proxy</option>
+            </select>
+          </label>
+          <label>
+            How should it be calculated?
+            <select
+              value={presetId}
+              onChange={(e) => setPresetId(e.target.value)}
+            >
+              {presets.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Definition text
+            <textarea value={text} onChange={(e) => setText(e.target.value)} />
+          </label>
+          <button className="primary" type="submit" disabled={busy}>
+            {busy ? "Submitting…" : "Submit for approval"}
+          </button>
+          {msg && <p className="msg ok">{msg}</p>}
+          {err && !pending?.length && <p className="msg err">{err}</p>}
+        </form>
+      </section>
     </>
   );
 }
 
-function AuditLog({ entries }) {
-  if (!entries?.length) return <p className="empty">Audit log empty.</p>;
-  return (
-    <ul className="audit-list">
-      {entries.map((e) => (
-        <li key={e.id}>
-          <div className="when">{new Date(e.created_at).toLocaleString()}</div>
-          <div>
-            <strong className="mono">{e.action}</strong> by {e.actor} ({e.actor_role}) ·{" "}
-            {e.entity_type}/{e.entity_id}
-          </div>
-          <div className="mono" style={{ color: "var(--muted)", marginTop: 2 }}>
-            {JSON.stringify(e.detail)}
-          </div>
-        </li>
-      ))}
-    </ul>
-  );
-}
+function HistoryPage({ entries }) {
+  if (!entries?.length) return <p className="empty">No history yet.</p>;
 
-function LatencyPanel({ data }) {
-  if (!data) return <p className="empty">No samples yet — hit a few endpoints.</p>;
+  const rows = entries.filter((e) =>
+    ["metric.propose", "metric.approve", "metric.reject"].includes(e.action)
+  );
+
+  if (!rows.length) {
+    return <p className="empty">No metric changes recorded yet.</p>;
+  }
+
   return (
     <>
-      <div className="latency-big">
-        <div>
-          <div className="n">{data.overall?.p50 ?? "—"}ms</div>
-          <div className="l">p50 overall</div>
-        </div>
-        <div>
-          <div className="n">{data.overall?.p99 ?? "—"}ms</div>
-          <div className="l">p99 overall</div>
-        </div>
-        <div>
-          <div className="n">{data.sampleCount ?? 0}</div>
-          <div className="l">samples</div>
-        </div>
+      <div className="page-intro">
+        <p>Who changed a metric definition, and what they did.</p>
       </div>
-      <p className="sub">{data.note}</p>
-      <table className="table">
+      <table className="history-table">
         <thead>
           <tr>
-            <th>Route</th>
-            <th>n</th>
-            <th>p50</th>
-            <th>p99</th>
+            <th>Time</th>
+            <th>Person</th>
+            <th>Action</th>
+            <th>Summary</th>
           </tr>
         </thead>
         <tbody>
-          {(data.routes || []).map((r) => (
-            <tr key={r.route}>
-              <td className="mono">{r.route}</td>
-              <td>{r.count}</td>
-              <td className="mono">{r.p50}ms</td>
-              <td className="mono">{r.p99}ms</td>
+          {rows.map((e) => (
+            <tr key={e.id}>
+              <td className="time">{new Date(e.created_at).toLocaleString()}</td>
+              <td>
+                {e.actor}
+                <div style={{ color: "var(--muted)", fontSize: "0.8rem" }}>{e.actor_role}</div>
+              </td>
+              <td>
+                <span
+                  className={`status-dot ${
+                    e.action === "metric.approve"
+                      ? "ok"
+                      : e.action === "metric.reject"
+                        ? "err"
+                        : ""
+                  }`}
+                />
+                {actionLabel(e.action)}
+              </td>
+              <td>{historySummary(e)}</td>
             </tr>
           ))}
         </tbody>
@@ -306,10 +432,9 @@ function LatencyPanel({ data }) {
 }
 
 export default function App() {
+  const [page, setPage] = useState("dashboard");
   const [role, setRoleState] = useState(getRole());
   const [actor, setActorState] = useState(getActor());
-  const [health, setHealth] = useState(null);
-  const [eventStats, setEventStats] = useState(null);
   const [dashboard, setDashboard] = useState(null);
   const [dashLoading, setDashLoading] = useState(true);
   const [dashError, setDashError] = useState(null);
@@ -322,17 +447,13 @@ export default function App() {
     setDashLoading(true);
     setDashError(null);
     try {
-      const [h, stats, dash, mets, pend, aud, lat] = await Promise.all([
-        api.health(),
-        api.eventStats(),
+      const [dash, mets, pend, aud, lat] = await Promise.all([
         api.dashboard(role),
         api.metrics(),
         api.pending(),
         api.audit(),
         api.latency(),
       ]);
-      setHealth(h);
-      setEventStats(stats);
       setDashboard(dash);
       setMetrics(mets.metrics || []);
       setPending(pend.changes || []);
@@ -340,7 +461,6 @@ export default function App() {
       setLatency(lat);
     } catch (e) {
       setDashError(e.message);
-      setHealth({ ok: false });
     } finally {
       setDashLoading(false);
     }
@@ -350,7 +470,7 @@ export default function App() {
     refreshAll();
     const t = setInterval(() => {
       api.latency().then(setLatency).catch(() => {});
-    }, 4000);
+    }, 5000);
     return () => clearInterval(t);
   }, [refreshAll]);
 
@@ -369,26 +489,22 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <h1>Definition-Safe BI</h1>
-          <p>
-            Cross-title analytics spine for fictional titles <strong>Atlas Siege</strong> and{" "}
-            <strong>Nova Lane</strong>. Metric definitions are versioned; dashboards only move
-            after human approval.
+          <p className="subtitle">
+            Multi-title metrics that only change after someone approves
           </p>
         </div>
-        <div className="controls">
-          <label>
-            Actor
+        <div className="top-controls">
+          <label className="field">
+            <span>Your name</span>
             <input
               value={actor}
               onChange={(e) => changeActor(e.target.value)}
               onBlur={refreshAll}
             />
           </label>
-          <div>
-            <div style={{ fontSize: "0.75rem", color: "var(--muted)", marginBottom: 4 }}>
-              ROLE VIEW
-            </div>
-            <div className="role-toggle">
+          <div className="field">
+            <span>View as</span>
+            <div className="segment" role="group" aria-label="Role">
               <button
                 type="button"
                 className={role === "marketing" ? "active" : ""}
@@ -405,62 +521,37 @@ export default function App() {
               </button>
             </div>
           </div>
-          <button type="button" onClick={refreshAll}>
-            Refresh
-          </button>
         </div>
       </header>
 
-      <div className="status-row">
-        <span className={`pill ${health?.ok ? "ok" : "err"}`}>
-          api {health?.ok ? "healthy" : "down"}
-        </span>
-        <span className="pill">events: {eventStats?.total ?? "—"}</span>
-        <span className="pill">pending changes: {pending.length}</span>
-      </div>
+      <nav className="nav" aria-label="Primary">
+        {PAGES.map((p) => (
+          <button
+            key={p.id}
+            type="button"
+            className={page === p.id ? "active" : ""}
+            onClick={() => setPage(p.id)}
+          >
+            {p.label}
+          </button>
+        ))}
+      </nav>
 
-      <div className="grid main">
-        <section className="panel">
-          <h2>{role === "design" ? "Game Design dashboard" : "Marketing dashboard"}</h2>
-          <p className="sub">
-            Same Postgres events + Redis hot path. Active metric registry versions only.
-          </p>
-          <Dashboard
+      <main>
+        {page === "dashboard" && (
+          <DashboardPage
             role={role}
             data={dashboard}
             loading={dashLoading}
             error={dashError}
+            latency={latency}
           />
-        </section>
-
-        <section className="panel">
-          <h2>Latency panel</h2>
-          <p className="sub">Real p50/p99 from this running API process.</p>
-          <LatencyPanel data={latency} />
-        </section>
-      </div>
-
-      <div className="grid bottom" style={{ marginTop: "1rem" }}>
-        <section className="panel">
-          <h2>Metric registry</h2>
-          <p className="sub">
-            Propose a new definition → pending change. Approve to publish; reject with a why.
-          </p>
-          <MetricRegistry metrics={metrics} actor={actor} onProposed={refreshAll} />
-        </section>
-
-        <section className="panel">
-          <h2>Pending HITL approvals</h2>
-          <p className="sub">Until approved, dashboards keep serving the previous active version.</p>
-          <PendingChanges changes={pending} onDone={refreshAll} />
-        </section>
-      </div>
-
-      <section className="panel" style={{ marginTop: "1rem" }}>
-        <h2>Audit log</h2>
-        <p className="sub">Who proposed, approved, or rejected what — and when.</p>
-        <AuditLog entries={audit} />
-      </section>
+        )}
+        {page === "changes" && (
+          <MetricChangesPage metrics={metrics} pending={pending} onDone={refreshAll} />
+        )}
+        {page === "history" && <HistoryPage entries={audit} />}
+      </main>
     </div>
   );
 }

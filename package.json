@@ -1,0 +1,11 @@
+{
+  "name": "definition-safe-bi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Definition-Safe Cross-Title BI — synthetic multi-title metric registry with HITL approval",
+  "license": "MIT",
+  "scripts": {
+    "up": "docker compose up --build",
+    "down": "docker compose down"
+  }
+}

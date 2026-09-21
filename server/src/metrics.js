@@ -118,34 +118,36 @@ export async function approveChange({ changeId, reviewedBy, actorRole, note }) {
     throw err;
   }
 
-  await query("BEGIN");
-  try {
-    await query(
-      `UPDATE metric_versions SET status = 'superseded'
-       WHERE metric_id = $1 AND version = $2 AND status = 'active'`,
-      [change.metric_id, change.from_version]
-    );
-    await query(
-      `UPDATE metric_versions
-       SET status = 'active', reviewed_by = $1, reviewed_at = NOW(), review_note = $2
-       WHERE id = $3`,
-      [reviewedBy, note || null, change.metric_version_id]
-    );
-    await query(
-      `UPDATE metric_definitions SET active_version = $1 WHERE id = $2`,
-      [change.to_version, change.metric_id]
-    );
-    await query(
-      `UPDATE pending_changes
-       SET status = 'approved', reviewed_by = $1, reviewed_at = NOW(), review_note = $2
-       WHERE id = $3`,
-      [reviewedBy, note || null, changeId]
-    );
-    await query("COMMIT");
-  } catch (e) {
-    await query("ROLLBACK");
-    throw e;
-  }
+  await withClient(async (client) => {
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `UPDATE metric_versions SET status = 'superseded'
+         WHERE metric_id = $1 AND version = $2 AND status = 'active'`,
+        [change.metric_id, change.from_version]
+      );
+      await client.query(
+        `UPDATE metric_versions
+         SET status = 'active', reviewed_by = $1, reviewed_at = NOW(), review_note = $2
+         WHERE id = $3`,
+        [reviewedBy, note || null, change.metric_version_id]
+      );
+      await client.query(
+        `UPDATE metric_definitions SET active_version = $1 WHERE id = $2`,
+        [change.to_version, change.metric_id]
+      );
+      await client.query(
+        `UPDATE pending_changes
+         SET status = 'approved', reviewed_by = $1, reviewed_at = NOW(), review_note = $2
+         WHERE id = $3`,
+        [reviewedBy, note || null, changeId]
+      );
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    }
+  });
 
   await cacheDelPattern("dash:*");
 

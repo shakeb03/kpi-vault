@@ -271,7 +271,7 @@ function MetricChangesPage({ metrics, pending, onDone }) {
             <div className="def-item" key={m.id}>
               <h3>{m.name}</h3>
               <p className="body">
-                {describeDefinition(m.key, m.definition_json, m.definition_sql_stub)}
+                {describeDefinition(m.key, m.definition_json, null)}
               </p>
               <p className="meta">Version {m.active_version} · approved</p>
             </div>

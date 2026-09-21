@@ -43,6 +43,7 @@ export const api = {
   dashboard: (role) => request(`/api/dashboard/${role}`),
   audit: () => request("/api/audit?limit=60"),
   latency: () => request("/api/latency"),
+  technical: () => request("/api/technical/snapshot"),
   propose: (key, body) =>
     request(`/api/metrics/${key}/propose`, { method: "POST", body: JSON.stringify(body) }),
   approve: (id, note) =>

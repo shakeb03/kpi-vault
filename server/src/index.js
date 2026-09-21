@@ -13,6 +13,7 @@ import {
   buildDashboard,
 } from "./metrics.js";
 import { seedEvents, ingestEvent } from "./seed.js";
+import { getTechnicalSnapshot } from "./technical.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 3848);
@@ -171,6 +172,15 @@ app.get("/api/audit", async (req, res) => {
 
 app.get("/api/latency", (_req, res) => {
   res.json(getLatencyStats());
+});
+
+app.get("/api/technical/snapshot", async (_req, res) => {
+  try {
+    const snapshot = await getTechnicalSnapshot();
+    res.json(snapshot);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 async function boot() {

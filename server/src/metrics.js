@@ -51,7 +51,11 @@ export async function proposeMetricChange({
     throw err;
   }
   const def = defs[0];
-  const nextVersion = def.active_version + 1;
+  const { rows: maxRows } = await query(
+    `SELECT COALESCE(MAX(version), 0)::int AS max_version FROM metric_versions WHERE metric_id = $1`,
+    [def.id]
+  );
+  const nextVersion = Math.max(def.active_version, maxRows[0].max_version) + 1;
 
   // Only one pending change per metric at a time
   const { rows: open } = await query(

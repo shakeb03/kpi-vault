@@ -5,6 +5,7 @@ const PAGES = [
   { id: "dashboard", label: "Dashboard" },
   { id: "changes", label: "Metric changes" },
   { id: "history", label: "History" },
+  { id: "technical", label: "Technical" },
 ];
 
 const METRIC_LABELS = {
@@ -431,6 +432,239 @@ function HistoryPage({ entries }) {
   );
 }
 
+function TechnicalPage({ snapshot, loading, error, onRefresh }) {
+  if (loading && !snapshot) return <p className="empty">Loading technical snapshot…</p>;
+  if (error && !snapshot) return <p className="msg err">{error}</p>;
+  if (!snapshot) return <p className="empty">No snapshot yet.</p>;
+
+  const highlight = snapshot.pipelineHighlight;
+  const cache = snapshot.redis?.stats || {};
+  const pg = snapshot.postgres?.tables || {};
+
+  return (
+    <>
+      <div className="page-intro tech-intro">
+        <p>
+          How data moves through this slice: events land in Postgres, dashboards read through
+          Redis, and metric definitions only reach the UI after approval.
+        </p>
+        <button type="button" onClick={onRefresh} disabled={loading}>
+          {loading ? "Refreshing…" : "Refresh live stats"}
+        </button>
+      </div>
+
+      <section className="zone">
+        <h2>System flow</h2>
+        <p className="help">Live path for Atlas Siege / Nova Lane events → approved dashboards.</p>
+        <div className="pipeline" aria-label="System pipeline">
+          <div className={`pipe-node ${highlight === "events" ? "active" : ""}`}>
+            <div className="pipe-title">Game events</div>
+            <div className="pipe-sub">Synthetic ingest</div>
+            <div className="pipe-stat">{snapshot.events?.total ?? 0} rows</div>
+          </div>
+          <div className="pipe-arrow" aria-hidden="true">
+            →
+          </div>
+          <div className={`pipe-node ${highlight === "api" ? "active" : ""}`}>
+            <div className="pipe-title">API (Node)</div>
+            <div className="pipe-sub">Express handlers</div>
+            <div className="pipe-stat">:3848</div>
+          </div>
+          <div className="pipe-arrow" aria-hidden="true">
+            →
+          </div>
+          <div className={`pipe-node ${highlight === "postgres" ? "active" : ""}`}>
+            <div className="pipe-title">Postgres</div>
+            <div className="pipe-sub">Source of truth</div>
+            <div className="pipe-stat">{pg.events ?? 0} events</div>
+          </div>
+          <div className="pipe-arrow" aria-hidden="true">
+            →
+          </div>
+          <div className={`pipe-node ${highlight === "redis" ? "active" : ""}`}>
+            <div className="pipe-title">Redis</div>
+            <div className="pipe-sub">Hot path cache</div>
+            <div className="pipe-stat">
+              {(snapshot.redis?.keysPresent || []).length} dash keys
+            </div>
+          </div>
+          <div className="pipe-arrow" aria-hidden="true">
+            →
+          </div>
+          <div className={`pipe-node ${highlight === "dashboards" ? "active" : ""}`}>
+            <div className="pipe-title">Dashboards</div>
+            <div className="pipe-sub">Approved versions only</div>
+            <div className="pipe-stat">Marketing · Design</div>
+          </div>
+        </div>
+
+        <div className="gate-row">
+          <div className={`gate-badge ${highlight === "approval_gate" ? "active" : ""}`}>
+            Approval gate
+          </div>
+          <p>
+            Proposed metric versions sit in <code>pending_changes</code> until Approve. Dashboards
+            keep reading the previous active version.
+            {pg.pending_changes > 0
+              ? ` Currently ${pg.pending_changes} waiting.`
+              : " No changes waiting right now."}
+          </p>
+        </div>
+      </section>
+
+      <section className="zone">
+        <h2>Live activity</h2>
+        <p className="help">
+          Counts from the running API · snapshot {new Date(snapshot.generatedAt).toLocaleTimeString()}
+        </p>
+        <div className="tech-grid">
+          <div className="tech-card">
+            <h3>Events by title</h3>
+            <ul className="tech-list">
+              {(snapshot.events?.byTitle || []).map((t) => (
+                <li key={t.id}>
+                  <span>{t.name}</span>
+                  <strong>{t.events}</strong>
+                </li>
+              ))}
+              <li>
+                <span>Total</span>
+                <strong>{snapshot.events?.total ?? 0}</strong>
+              </li>
+            </ul>
+          </div>
+          <div className="tech-card">
+            <h3>Postgres · source of truth</h3>
+            <ul className="tech-list">
+              <li>
+                <span>events</span>
+                <strong>{pg.events ?? 0}</strong>
+              </li>
+              <li>
+                <span>metric_definitions</span>
+                <strong>{pg.metric_definitions ?? 0}</strong>
+              </li>
+              <li>
+                <span>pending_changes</span>
+                <strong>{pg.pending_changes ?? 0}</strong>
+              </li>
+              <li>
+                <span>audit_log</span>
+                <strong>{pg.audit_log ?? 0}</strong>
+              </li>
+            </ul>
+            <div className="code-strip">
+              metric_versions: {JSON.stringify(pg.metric_versions || {})}
+            </div>
+          </div>
+          <div className="tech-card">
+            <h3>Redis · hot path</h3>
+            <ul className="tech-list">
+              <li>
+                <span>Cache hits</span>
+                <strong>{cache.hits ?? 0}</strong>
+              </li>
+              <li>
+                <span>Cache misses</span>
+                <strong>{cache.misses ?? 0}</strong>
+              </li>
+              <li>
+                <span>Invalidations</span>
+                <strong>{cache.invalidations ?? 0}</strong>
+              </li>
+              <li>
+                <span>Keys present</span>
+                <strong>{(snapshot.redis?.keysPresent || []).join(", ") || "none"}</strong>
+              </li>
+            </ul>
+            <div className="code-strip">
+              pattern {snapshot.redis?.keyPattern} · TTL {snapshot.redis?.ttlSeconds}s
+              {cache.lastSetAt ? ` · last set ${new Date(cache.lastSetAt).toLocaleTimeString()}` : ""}
+              {cache.lastInvalidateAt
+                ? ` · last invalidate ${new Date(cache.lastInvalidateAt).toLocaleTimeString()}`
+                : ""}
+            </div>
+          </div>
+          <div className="tech-card">
+            <h3>Latency</h3>
+            <ul className="tech-list">
+              <li>
+                <span>Typical (p50)</span>
+                <strong>{snapshot.latency?.p50 ?? "—"} ms</strong>
+              </li>
+              <li>
+                <span>Slow requests (p99)</span>
+                <strong>{snapshot.latency?.p99 ?? "—"} ms</strong>
+              </li>
+              <li>
+                <span>Samples</span>
+                <strong>{snapshot.latency?.sampleCount ?? 0}</strong>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <h3 className="tech-subhead">Recent audit actions</h3>
+        <table className="history-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Action</th>
+              <th>Actor</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(snapshot.recentAudit || []).map((e) => (
+              <tr key={e.id}>
+                <td className="time">{new Date(e.createdAt).toLocaleString()}</td>
+                <td>{actionLabel(e.action)}</td>
+                <td>
+                  {e.actor}
+                  <div style={{ color: "var(--muted)", fontSize: "0.8rem" }}>{e.actorRole}</div>
+                </td>
+                <td className="code-cell">
+                  {typeof e.detail === "string" ? e.detail : JSON.stringify(e.detail)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+
+      <section className="zone">
+        <h2>How a metric change moves</h2>
+        <p className="help">Propose → approve → invalidate cache → dashboards recompute.</p>
+        <ol className="lifecycle">
+          <li>
+            <strong>Propose</strong> inserts a <code>pending</code> row in{" "}
+            <code>metric_versions</code> + <code>pending_changes</code>. Dashboards still join the
+            old <code>active_version</code>.
+          </li>
+          <li>
+            <strong>Approve</strong> marks the old version <code>superseded</code>, the new one{" "}
+            <code>active</code>, bumps <code>metric_definitions.active_version</code>, writes{" "}
+            <code>audit_log</code>.
+          </li>
+          <li>
+            <strong>Cache</strong> deletes Redis keys matching <code>dash:*</code> so the next
+            dashboard read rebuilds from Postgres.
+          </li>
+          <li>
+            <strong>Dashboard</strong> recomputes DAU / D1 / revenue using{" "}
+            <code>definition_json</code> from the newly active version only.
+          </li>
+        </ol>
+        <div className="code-strip block">
+          tables: {(snapshot.schemaNotes?.tables || []).join(", ")}
+          {" · "}
+          redis: {(snapshot.schemaNotes?.redisKeys || []).join(", ")}
+        </div>
+      </section>
+    </>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState("dashboard");
   const [role, setRoleState] = useState(getRole());
@@ -442,6 +676,9 @@ export default function App() {
   const [pending, setPending] = useState([]);
   const [audit, setAudit] = useState([]);
   const [latency, setLatency] = useState(null);
+  const [technical, setTechnical] = useState(null);
+  const [techLoading, setTechLoading] = useState(false);
+  const [techError, setTechError] = useState(null);
 
   const refreshAll = useCallback(async () => {
     setDashLoading(true);
@@ -466,6 +703,21 @@ export default function App() {
     }
   }, [role]);
 
+  const refreshTechnical = useCallback(async () => {
+    setTechLoading(true);
+    setTechError(null);
+    try {
+      // Touch dashboards once so Redis hit/miss counters move.
+      await api.dashboard(role).catch(() => {});
+      const snap = await api.technical();
+      setTechnical(snap);
+    } catch (e) {
+      setTechError(e.message);
+    } finally {
+      setTechLoading(false);
+    }
+  }, [role]);
+
   useEffect(() => {
     refreshAll();
     const t = setInterval(() => {
@@ -473,6 +725,10 @@ export default function App() {
     }, 5000);
     return () => clearInterval(t);
   }, [refreshAll]);
+
+  useEffect(() => {
+    if (page === "technical") refreshTechnical();
+  }, [page, refreshTechnical]);
 
   function changeRole(next) {
     setRole(next);
@@ -551,6 +807,14 @@ export default function App() {
           <MetricChangesPage metrics={metrics} pending={pending} onDone={refreshAll} />
         )}
         {page === "history" && <HistoryPage entries={audit} />}
+        {page === "technical" && (
+          <TechnicalPage
+            snapshot={technical}
+            loading={techLoading}
+            error={techError}
+            onRefresh={refreshTechnical}
+          />
+        )}
       </main>
     </div>
   );
